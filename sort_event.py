@@ -28,6 +28,7 @@ import cv2
 import glob
 import time
 import argparse
+import pandas as pd
 from filterpy.kalman import KalmanFilter
 
 from metavision_sdk_core import EventBbox
@@ -35,7 +36,7 @@ from metavision_sdk_core import BaseFrameGenerationAlgorithm
 from metavision_core.event_io.py_reader import EventDatReader
 from metavision_core.event_io.events_iterator import EventsIterator
 from metavision_core.event_io import EventNpyReader
-
+from numpy.lib.recfunctions import structured_to_unstructured
 np.random.seed(0)
 
 def nms(box_events, scores, iou_thresh=0.5):
@@ -141,10 +142,12 @@ class KalmanBoxTracker(object):
 	This class represents the internal state of individual tracked objects observed as bbox.
 	"""
 	count = 0
-	def __init__(self,bbox):
+	def __init__(self, bbox):
 		"""
 		Initialises a tracker using initial bounding box.
 		"""
+		# bbox: [x1,y1,x2,y2,score],[x1,y1,x2,y2,score]  (old)
+  		# 	    [t, x1, y1, x2, y2, class_id, track_id, confidence]  (new)
 		#define constant velocity model
 		self.kf = KalmanFilter(dim_x=7, dim_z=4) 
 		self.kf.F = np.array([[1,0,0,0,1,0,0],[0,1,0,0,0,1,0],[0,0,1,0,0,0,1],[0,0,0,1,0,0,0],  [0,0,0,0,1,0,0],[0,0,0,0,0,1,0],[0,0,0,0,0,0,1]])
@@ -156,7 +159,8 @@ class KalmanBoxTracker(object):
 		self.kf.Q[-1,-1] *= 0.01
 		self.kf.Q[4:,4:] *= 0.01
 
-		self.kf.x[:4] = convert_bbox_to_z(bbox)
+		self.kf.x[:4] = convert_bbox_to_z(bbox[1:5])
+		self.bbox = bbox
 		self.time_since_update = 0
 		self.id = KalmanBoxTracker.count
 		KalmanBoxTracker.count += 1
@@ -172,12 +176,16 @@ class KalmanBoxTracker(object):
 		"""
 		Updates the state vector with observed bbox.
 		"""
+		# bbox: [x1,y1,x2,y2,score],[x1,y1,x2,y2,score]  (old)
+  		# 	    [t, x1, y1, x2, y2, class_id, track_id, confidence]  (new)
+
 		self.time_since_update = 0
 		self.history = []
 		self.hits += 1
 		self.hit_streak += 1
-		x1,y1,x2,y2, confidence = bbox
-		x1,y1,x2,y2 = int(x1),int(y1),int(x2),int(y2)
+		# x1,y1,x2,y2, confidence = bbox
+		t, x1, y1, x2, y2, class_id, track_id, confidence = bbox
+		x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
 		self.bboxes_center.append(np.array([(x1+x2)//2, (y1+y2)//2]))
 
 		x1 = np.clip(x1, 0, ev_width)
@@ -188,8 +196,9 @@ class KalmanBoxTracker(object):
 		h = y2 - y1
 		density = np.sum(bmap[y1:y2, x1:x2]) / (w*h)
 		self.bboxes_density.append(density)
-   
-		self.kf.update(convert_bbox_to_z(bbox))
+
+		self.kf.update(convert_bbox_to_z(bbox[1:5]))
+		self.bbox = bbox
 
 	def predict(self):
 		"""
@@ -204,7 +213,9 @@ class KalmanBoxTracker(object):
 		self.time_since_update += 1
 
 		if self.hits_old != self.hits:
-			self.history.append(convert_x_to_bbox(self.kf.x))
+			self.bbox[1:5] = np.squeeze(convert_x_to_bbox(self.kf.x))
+			self.bbox[6] = self.id
+			self.history.append(np.array(self.bbox).reshape((1,8)))
 			self.hits_old = self.hits
 		return self.history[-1]
 
@@ -213,7 +224,9 @@ class KalmanBoxTracker(object):
 		Returns the current bounding box estimate.
 		"""
 		if len(self.history) == 0:
-			return convert_x_to_bbox(self.kf.x)
+			self.bbox[1:5] = np.squeeze(convert_x_to_bbox(self.kf.x))
+			self.bbox[6] = self.id
+			return np.array(self.bbox).reshape((1,8))
 		else:
 			return self.history[-1]
 
@@ -224,10 +237,12 @@ def associate_detections_to_trackers(detections,trackers,iou_threshold = 0.3):
 
 	Returns 3 lists of matches, unmatched_detections and unmatched_trackers
 	"""
+	# bbox: [[x1,y1,x2,y2,score],[x1,y1,x2,y2,score],...] (old)
+	#       [[t, x1, y1, x2, y2, class_id, track_id, confidence], ...] (new)
 	if(len(trackers)==0):
 		return np.empty((0,2),dtype=int), np.arange(len(detections)), np.empty((0,5),dtype=int)
 
-	iou_matrix = iou_batch(detections, trackers)
+	iou_matrix = iou_batch(detections[:, 1:5], trackers[:, 1:5])
 
 	if min(iou_matrix.shape) > 0:
 		a = (iou_matrix > iou_threshold).astype(np.int32)
@@ -273,11 +288,13 @@ class Sort(object):
 		self.iou_threshold = iou_threshold
 		self.trackers = []
 		self.frame_count = 0
+		self.label_dtype = {'names':['t','x','y','w','h','class_id','track_id','class_confidence'], 'formats':['<i8','<f4','<f4','<f4','<f4','<u4','<u4','<f4'], 'offsets':[0,8,12,16,20,24,28,32], 'itemsize':40}
 
-	def update(self, dets=np.empty((0, 5)), bmap=None, ev_height=0, ev_width=0):
+	def update(self, dets=np.empty((0, 8)), bmap=None, ev_height=0, ev_width=0):
 		"""
 		Params:
-		dets - a numpy array of detections in the format [[x1,y1,x2,y2,score],[x1,y1,x2,y2,score],...]
+		dets - a numpy array of detections in the format [[x1,y1,x2,y2,score],[x1,y1,x2,y2,score],...] (old)
+  														 [[t, x1, y1, x2, y2, class_id, track_id, confidence], ...] (new)
 		Requires: this method must be called once for each frame even with empty detections (use np.empty((0, 5)) for frames without detections).
 		Returns the a similar array, where the last column is the object ID.
 
@@ -285,13 +302,14 @@ class Sort(object):
 		"""
 		self.frame_count += 1
 		# get predicted locations from existing trackers.
-		trks = np.zeros((len(self.trackers), 5))
+		trks = np.zeros((len(self.trackers), 8))
 		to_del = []
 		ret = []
 		discard = []
 		for t, trk in enumerate(trks):
 			pos = self.trackers[t].predict()[0]
-			trk[:] = [pos[0], pos[1], pos[2], pos[3], 0]
+			trk[:] = pos.tolist() # [pos[0], pos[1], pos[2], pos[3], 0] (old)
+								  # [t, x1, y1, x2, y2, class_id, track_id, confidence] (new)
 			if np.any(np.isnan(pos)):
 				to_del.append(t)
 		trks = np.ma.compress_rows(np.ma.masked_invalid(trks))
@@ -310,7 +328,10 @@ class Sort(object):
 		i = len(self.trackers)
 		for trk in reversed(self.trackers):
 			d = trk.get_state()[0]
-			x1, y1, x2, y2 = int(d[0]), int(d[1]), int(d[2]), int(d[3])
+			# d: [x1,y1,x2,y2,score],[x1,y1,x2,y2,score]  (old)
+			# 	 [t, x1, y1, x2, y2, class_id, track_id, confidence]  (new)
+
+			x1, y1, x2, y2 = int(d[1]), int(d[2]), int(d[3]), int(d[4])
 			x1 = np.clip(x1, 0, ev_width)
 			y1 = np.clip(y1, 0, ev_height)
 			x2 = np.clip(x2, 0, ev_width)
@@ -328,12 +349,18 @@ class Sort(object):
    			#    ((trk.hits == trk.hits_old) and len(trk.bboxes_center) >=2 and np.abs(trk.bboxes_center[-1][0] - trk.bboxes_center[-2][0])<=3 and
           	# 	np.abs(trk.bboxes_center[-1][1] - trk.bboxes_center[-2][1])<=3) or 
          	#    (len(trk.bboxes_center)==0 and density>=0.2)):
-				ret.append(np.concatenate((d,[trk.id+1])).reshape(1,-1)) # +1 as MOT benchmark requires positive
+
+				# ret.append(np.concatenate((d,[trk.id+1])).reshape(1,-1)) # +1 as MOT benchmark requires positive
+				d[6] = trk.id+1
+				ret.append(d.reshape(1,-1)) # +1 as MOT benchmark requires positive
 				count = count + 1
+				d_list = list(map(tuple, [d]))
+				dp = np.asarray(d_list, dtype=self.label_dtype)
+
 				if len(trk.bboxes_center) == 0:
-					print("O", d, density, len(trk.bboxes_center), trk.id+1)
+					print("O{}".format(count), dp, density, len(trk.bboxes_center))
 				else:
-					print("O", d, density, len(trk.bboxes_center), trk.bboxes_center[0], trk.bboxes_center[-1], trk.bboxes_density[0], trk.bboxes_density[-1], trk.id+1)
+					print("O{}".format(count), dp, density, len(trk.bboxes_center), trk.bboxes_center[0], trk.bboxes_center[-1], trk.bboxes_density[0], trk.bboxes_density[-1])
     
 			i -= 1
 			# remove dead tracklet
@@ -352,23 +379,83 @@ class Sort(object):
        			(len(trk.bboxes_center)==0 and density<0.1)
           	   ):
 				self.trackers.pop(i)
-				discard.append(np.concatenate((d,[trk.id+1])).reshape(1,-1))
+				# discard.append(np.concatenate((d,[trk.id+1])).reshape(1,-1))
+				discard.append(d.reshape(1,-1))
 				count = count + 1
+				d_list = list(map(tuple, [d]))
+				dp = np.asarray(d_list, dtype=self.label_dtype)
+
 				if len(trk.bboxes_center) == 0:
-					print("X", d, density, len(trk.bboxes_center), trk.id+1)
+					print("X{}".format(count), dp, density, len(trk.bboxes_center))
 				else:
-					print("X", d, density, len(trk.bboxes_center), trk.bboxes_center[0], trk.bboxes_center[-1], trk.bboxes_density[0], trk.bboxes_density[-1], trk.id+1)
+					print("X{}".format(count), dp, density, len(trk.bboxes_center), trk.bboxes_center[0], trk.bboxes_center[-1], trk.bboxes_density[0], trk.bboxes_density[-1])
 
 			if count == 0:
+				d[6] = trk.id+1
+				d_list = list(map(tuple, [d]))
+				dp = np.asarray(d_list, dtype=self.label_dtype)
 				if len(trk.bboxes_center) == 0:
-					print("X", d, density, len(trk.bboxes_center), trk.id+1)
+					print("#{}".format(count), dp, density, len(trk.bboxes_center))
 				else:
-					print("X", d, density, len(trk.bboxes_center), trk.bboxes_center[0], trk.bboxes_center[-1], trk.bboxes_density[0], trk.bboxes_density[-1], trk.id+1)
-     
+					print("#{}".format(count), dp, density, len(trk.bboxes_center), trk.bboxes_center[0], trk.bboxes_center[-1], trk.bboxes_density[0], trk.bboxes_density[-1])
+
 		print("= "*50)
 		if(len(ret)>0):
 			return np.concatenate(ret)
-		return np.empty((0,5))
+		return np.empty((0,8))
+
+def get_and_draw_stats(gnds, dets, iou_threshold, stats, image_all, width_offset, height_offset):
+	matched, unmatched_gnds, unmatched_dets = associate_detections_to_trackers(gnds, dets, iou_threshold)
+
+	for m in matched:
+		gnd = gnds[m[0], :]
+		det = dets[m[1], :]
+
+		t, x1, y1, x2, y2, class_id, track_id, confidence = det
+		w = x2 - x1
+		h = y2 - y1
+		x, y, w, h = int(x1), int(y1), int(w), int(h)
+		gnd_class_id = int(gnd[5])
+		det_class_id = int(det[5])
+
+		stats.at[gnd_class_id, 'GT'] = stats.at[gnd_class_id, 'GT'] + 1
+		stats.at[det_class_id, 'DT'] = stats.at[det_class_id, 'DT'] + 1
+		if det_class_id == gnd_class_id:
+			stats.at[det_class_id, 'TP'] = stats.at[det_class_id, 'TP'] + 1
+			# cv2.putText(image_all, str(int(track_id)), (width_offset+x, height_offset+y-6), cv2.FONT_HERSHEY_TRIPLEX, 0.6, colors[4], 1, cv2.LINE_AA)
+			cv2.rectangle(image_all, (width_offset+x, height_offset+y), (width_offset+x+w, height_offset+y+h), colors[4], 1) # green
+		else:
+			stats.at[gnd_class_id, 'FP_wrong_id'] = stats.at[gnd_class_id, 'FP_wrong_id'] + 1
+			stats.at[det_class_id, 'FP'] = stats.at[det_class_id, 'FP'] + 1
+			# cv2.putText(image_all, str(int(track_id)), (width_offset+x, height_offset+y-6), cv2.FONT_HERSHEY_TRIPLEX, 0.6, colors[8], 1, cv2.LINE_AA)
+			cv2.rectangle(image_all, (width_offset+x, height_offset+y), (width_offset+x+w, height_offset+y+h), colors[8], 1) # magenta
+
+	# FN
+	for i in unmatched_gnds:
+		gnd = gnds[i, :]
+		t, x1, y1, x2, y2, class_id, track_id, confidence = gnd
+		w = x2 - x1
+		h = y2 - y1
+		x, y, w, h = int(x1), int(y1), int(w), int(h)
+		gnd_class_id = int(gnd[5])
+		stats.at[gnd_class_id, 'GT'] = stats.at[gnd_class_id, 'GT'] + 1
+		stats.at[gnd_class_id, 'FN'] = stats.at[gnd_class_id, 'FN'] + 1
+		# cv2.putText(image_all, str(int(track_id)), (width_offset+x, height_offset+y-6), cv2.FONT_HERSHEY_TRIPLEX, 0.6, colors[2], 1, cv2.LINE_AA)
+		cv2.rectangle(image_all, (width_offset+x, height_offset+y), (width_offset+x+w, height_offset+y+h), colors[2], 1) # yellow
+
+	# FP
+	for i in unmatched_dets:
+		det = dets[i, :]
+		t, x1, y1, x2, y2, class_id, track_id, confidence = det
+		w = x2 - x1
+		h = y2 - y1
+		x, y, w, h = int(x1), int(y1), int(w), int(h)
+		det_class_id = int(det[5])
+		stats.at[det_class_id, 'DT'] = stats.at[det_class_id, 'DT'] + 1
+		stats.at[det_class_id, 'FP'] = stats.at[det_class_id, 'FP'] + 1
+		# cv2.putText(image_all, str(int(track_id)), (width_offset+x, height_offset+y-6), cv2.FONT_HERSHEY_TRIPLEX, 0.6, colors[0], 1, cv2.LINE_AA)
+		cv2.rectangle(image_all, (width_offset+x, height_offset+y), (width_offset+x+w, height_offset+y+h), colors[0], 1) # red
+	return stats, image_all
 
 def parse_args():
     """Parse input arguments."""
@@ -379,7 +466,7 @@ def parse_args():
     parser.add_argument("--max_age", 
                         help="Maximum number of frames to keep alive a track without associated detections.", 
                         type=int, default=1)
-    parser.add_argument("--min_hits", 
+    parser.add_argument("--min_hits",
                         help="Minimum number of associated detections before track is initialised.", 
                         type=int, default=3)
     parser.add_argument("--iou_threshold", help="Minimum IOU for match.", type=float, default=0.3)
@@ -398,32 +485,72 @@ if __name__ == '__main__':
 
 	evaluation_dir = "/home/tkyen/opencv_practice/data_3/Gen4_Automotive_event_cube_paper/result_vanilla_ssd_level_5/evaluation_epoch_31"
 	event_dir = "/home/tkyen/opencv_practice/data_1/Gen4_Automotive/test_dat"
-	output_dir = os.path.join(evaluation_dir, "dt_SORT")
-	os.makedirs(output_dir, exist_ok=True)
+	output_label_dir = os.path.join(evaluation_dir, "dt_SORT_min_hits_{}".format(args.min_hits))
+	os.makedirs(output_label_dir, exist_ok=True)
+	output_video_dir = os.path.join(evaluation_dir, "dt_SORT_video_min_hits_{}".format(args.min_hits))
+	os.makedirs(output_video_dir, exist_ok=True)
 
 	gt_label_dir = os.path.join(evaluation_dir, "gt")
 	dt_label_dir = os.path.join(evaluation_dir, "dt")
 	pattern = os.path.join(dt_label_dir, '*_bbox.npy')
 	delta_t = 50000
 
-	colors_hsv = np.uint8([[[0,255,255], [20,255,255], [40,255,255], [60,255,255], [80,255,255], [100,255,255], [120,255,255], [140,255,255]]])
+	colors_hsv = np.uint8([[[0,255,255], [20,255,255], [30,255,255], [40,255,255], [60,255,255], [90,255,255], [105,255,255], [140,255,255], [150,255,255]]])
+	#                               red, light orange,       yellow,  light green,    deep green,    light blue,     deep blue,      purple,       magenta
 	colors_bgr = cv2.cvtColor(colors_hsv, cv2.COLOR_HSV2BGR).squeeze()
 	colors = colors_bgr.tolist()
+
+	ev_dtype = {'names':['x','y','p','t'], 'formats':['<u2','<u2','<i2','<i8'], 'offsets':[0,2,4,8], 'itemsize':16}
+	label_dtype = {'names':['t','x','y','w','h','class_id','track_id','class_confidence'], 
+                   'formats':['<i8','<f4','<f4','<f4','<f4','<u4','<u4','<f4'], 
+                   'offsets':[0,8,12,16,20,24,28,32], 'itemsize':40}
+
+	stats_dets = pd.DataFrame({	"class_id": ['background', 'pedestrian', 'two wheeler', 'car', 'truck', 'bus', 'traffic sign', 'traffic light', 'total'],
+						  		"TP" : np.zeros(9, dtype=np.uint16).tolist(),
+								"FP_wrong_id" : np.zeros(9, dtype=np.uint16).tolist(),
+        				  		"FP" : np.zeros(9, dtype=np.uint16).tolist(),
+						  		"DT" : np.zeros(9, dtype=np.uint16).tolist(),
+              			  		"FN" : np.zeros(9, dtype=np.uint16).tolist(),
+                   		  		"GT" : np.zeros(9, dtype=np.uint16).tolist(),
+                       	  		"Precision" : np.zeros(9, dtype=np.float32).tolist(),
+                          		"Recall" : np.zeros(9, dtype=np.float32).tolist()})
+	stats_trks = pd.DataFrame({	"class_id": ['background', 'pedestrian', 'two wheeler', 'car', 'truck', 'bus', 'traffic sign', 'traffic light', 'total'],
+								"TP" : np.zeros(9, dtype=np.uint16).tolist(),
+								"FP_wrong_id" : np.zeros(9, dtype=np.uint16).tolist(),
+								"FP" : np.zeros(9, dtype=np.uint16).tolist(),
+								"DT" : np.zeros(9, dtype=np.uint16).tolist(),
+								"FN" : np.zeros(9, dtype=np.uint16).tolist(),
+								"GT" : np.zeros(9, dtype=np.uint16).tolist(),
+								"Precision" : np.zeros(9, dtype=np.float32).tolist(),
+								"Recall" : np.zeros(9, dtype=np.float32).tolist()})
+	# TP: green ; FP: red ; FN: yellow
+	#         class_id  TP  FP  DT  FN  GT  Precision  Recall
+	# 0     background   0   0   0   0   0        0.0     0.0
+	# 1     pedestrian   0   0   0   0   0        0.0     0.0
+	# 2    two wheeler   0   0   0   0   0        0.0     0.0
+	# 3            car   0   0   0   0   0        0.0     0.0
+	# 4          truck   0   0   0   0   0        0.0     0.0
+	# 5            bus   0   0   0   0   0        0.0     0.0
+	# 6   traffic sign   0   0   0   0   0        0.0     0.0
+	# 7  traffic light   0   0   0   0   0        0.0     0.0
+	# 8          total   0   0   0   0   0        0.0     0.0
 
 	for dt_label_path in glob.glob(pattern):
 		seq_base = os.path.basename(dt_label_path)
 		seq = seq_base.replace("_bbox.npy","")
-		if seq not in ["moorea_2019-02-19_001_td_1220500000_1280500000",
-					   "moorea_2019-02-19_003_td_1586500000_1646500000",
-                 	   "moorea_2019-02-19_005_td_915500000_975500000",
-					   "moorea_2019-02-19_005_td_1159500000_1219500000",
-        			   "moorea_2019-02-19_005_td_1220500000_1280500000",
-              		   "moorea_2019-02-21_000_td_2440500000_2500500000",
-                   	   "moorea_2019-02-21_000_td_2501500000_2561500000"]:
-			continue
+		# if seq not in ["moorea_2019-06-19_000_793500000_853500000"]:
+		# 	continue
+		# if seq not in [	"moorea_2019-02-19_001_td_1220500000_1280500000",
+		# 				"moorea_2019-02-19_003_td_1586500000_1646500000",
+		# 				"moorea_2019-02-19_005_td_915500000_975500000",
+		# 				"moorea_2019-02-19_005_td_1159500000_1219500000",
+		# 				"moorea_2019-02-19_005_td_1220500000_1280500000",
+		# 				"moorea_2019-02-21_000_td_2440500000_2500500000",
+		# 				"moorea_2019-02-21_000_td_2501500000_2561500000"]:
+		# 	continue
 		event_path = os.path.join(event_dir, seq_base.replace("_bbox.npy","_td.dat"))
 		gt_label_path = os.path.join(gt_label_dir, seq_base)
-		output_path = os.path.join(output_dir, seq_base)
+		output_label_path = os.path.join(output_label_dir, seq_base)
 
   		# create instance of the SORT tracker
 		KalmanBoxTracker.count = 0
@@ -446,10 +573,10 @@ if __name__ == '__main__':
 		# VideoWriter
 		fourcc = cv2.VideoWriter_fourcc('m', 'p', '4', 'v')
 		frame_rate = 10
-		video_writer = cv2.VideoWriter(os.path.join(output_dir, '{}.mp4'.format(seq)), fourcc, frame_rate, (ev_width*2, ev_height*2))
-		ev_dtype = {'names':['x','y','p','t'], 'formats':['<u2','<u2','<i2','<i8'], 'offsets':[0,2,4,8], 'itemsize':16}
+		video_writer = cv2.VideoWriter(os.path.join(output_video_dir, '{}.mp4'.format(seq)), fourcc, frame_rate, (ev_width*2, ev_height*2))
     
 		print("Processing %s."%(seq))
+		trackers_list = []
 		for frame in range(int(60e6//delta_t)):
 			print('{} ms'.format(frame*delta_t//1000))
 			frame += 1 #detection and frame numbers begin at 1
@@ -457,13 +584,14 @@ if __name__ == '__main__':
 			events = event_dat.load_delta_t(delta_t)
 			events['x'] = events['x'] >> downsample
 			events['y'] = events['y'] >> downsample
-			bmap = np.zeros((ev_height, ev_width), dtype=bool)
+			bmap = np.zeros((ev_height, ev_width), dtype=np.uint8)
+			events = events[(events['x'] >= 0) * (events['x'] < ev_width) * (events['y'] >= 0) * (events['y'] < ev_height)]
 			bmap[events['y'], events['x']] = 1
 
 			image_all = np.zeros((ev_height*2, ev_width*2, 3), dtype=np.uint8)
 			BaseFrameGenerationAlgorithm.generate_frame(events, image_all[:ev_height, :ev_width, :])
 			image_all[:ev_height, ev_width:, :] = image_all[:ev_height, :ev_width, :].copy()
-			image_all[ev_height:, :ev_width, :] = image_all[:ev_height, :ev_width, :].copy()
+			image_all[ev_height:, :ev_width, :] = np.repeat(bmap[..., np.newaxis], 3, axis=2) * 255
 			image_all[ev_height:, ev_width:, :] = image_all[:ev_height, :ev_width, :].copy()
 			# top left
 			cv2.putText(image_all, 'GT',
@@ -504,37 +632,65 @@ if __name__ == '__main__':
 					cv2.rectangle(image_all, (x, y), (x+w, y+h), colors[class_id], 1)
 					cv2.rectangle(image_all, (x, ev_height+y), (x+w, ev_height+y+h), colors[class_id], 1)
 
-			for dt_box in dt_boxes:
-				t, x, y, w, h, class_id, track_id, confidence = dt_box
-				x, y, w, h = int(x), int(y), int(w), int(h)
-				# cv2.putText(image_all, str(round(confidence, 3)), (ev_width+x, y-6), cv2.FONT_HERSHEY_TRIPLEX, 0.6, colors[class_id], 1, cv2.LINE_AA)
-				# cv2.putText(image_all, str("[{}, {}]".format(int(x+w//2), int(y+h//2))), (ev_width+x+40, y-6), cv2.FONT_HERSHEY_TRIPLEX, 0.6, colors[0], 1, cv2.LINE_AA)
-				cv2.rectangle(image_all, (ev_width+x, y), (ev_width+x+w, y+h), colors[class_id], 1)
+			gt_boxes['t'] = gt_boxes['t'] // 1000
+			gnds = structured_to_unstructured(gt_boxes) # [[t, x, y, w, h, class_id, track_id, confidence], ...]
+			gnds[:, 3:5] += gnds[:, 1:3]				# [[t, x1, y1, x2, y2, class_id, track_id, confidence], ...]
 
-			dets = np.concatenate((dt_boxes['x'][:, None], dt_boxes['y'][:, None], dt_boxes['w'][:, None], dt_boxes['h'][:, None], dt_boxes['class_confidence'][:, None]), axis=1)
-			dets[:, 2:4] += dets[:, 0:2] #convert to [x1,y1,w,h] to [x1,y1,x2,y2]
-			# dets = np.array([[x1, y1, x2, y2, confidence], 
-			#                  [...]])
+			dt_boxes['t'] = dt_boxes['t'] // 1000
+			dets = structured_to_unstructured(dt_boxes) # [[t, x, y, w, h, class_id, track_id, confidence], ...]
+			dets[:, 3:5] += dets[:, 1:3]				# [[t, x1, y1, x2, y2, class_id, track_id, confidence], ...]
+
 			total_frames += 1
-
 			start_time = time.time()
+			'''
+			gnds_list = list(map(tuple, gnds.tolist()))
+			gnds_npy = np.asarray(gnds_list, dtype=label_dtype)
+			print(gnds_npy)
+			'''
 			trackers = mot_tracker.update(dets, bmap, ev_height, ev_width)
 			cycle_time = time.time() - start_time
 			total_time += cycle_time
 
-			for d in trackers:
-				x, y, x2, y2, track_id = d[0], d[1], d[2], d[3], d[4]
-				w = x2 -x
-				h = y2 -y
-				x, y, w, h = int(x), int(y), int(w), int(h)
-				cv2.putText(image_all, str(int(track_id)), (ev_width+x, ev_height+y-6), cv2.FONT_HERSHEY_TRIPLEX, 0.6, colors[0], 1, cv2.LINE_AA)
-				# cv2.putText(image_all, str("[{}, {}]".format(int((x+x2)//2), int((y+y2)//2))), (ev_width+x+40, ev_height+y-6), cv2.FONT_HERSHEY_TRIPLEX, 0.6, colors[0], 1, cv2.LINE_AA)
-				cv2.rectangle(image_all, (ev_width+x, ev_height+y), (ev_width+x+w, ev_height+y+h), colors[0], 1)
-				# print('%d,%d,%.2f,%.2f,%.2f,%.2f,1,-1,-1,-1'%(frame,d[4],d[0],d[1],d[2]-d[0],d[3]-d[1]),file=out_file)
+			stats_dets, image_all = get_and_draw_stats(gnds,     dets, args.iou_threshold, stats_dets, image_all, width_offset=ev_width, height_offset=0)
+			stats_trks, image_all = get_and_draw_stats(gnds, trackers, args.iou_threshold, stats_trks, image_all, width_offset=ev_width, height_offset=ev_height)
 
+			if len(trackers) > 0:
+				trackers[:, 0] = (frame-1) * delta_t
+				trackers[:, 3] = trackers[:, 3] - trackers[:, 1]
+				trackers[:, 4] = trackers[:, 4] - trackers[:, 2]
+				trackers_list.extend(trackers.tolist())
 			video_writer.write(image_all)
+
+		trackers_list = list(map(tuple, trackers_list))
+		trackers_npy = np.asarray(trackers_list, dtype=label_dtype)
+		np.save(output_label_path, trackers_npy)
 		video_writer.release()
 	print("Total Tracking took: %.3f seconds for %d frames or %.1f FPS" % (total_time, total_frames, total_frames / total_time))
+
+	for key in ['TP', 'FP_wrong_id', 'FP', 'DT', 'FN', 'GT']:
+		stats_dets.loc[8, key] = np.sum(stats_dets[key][1:8])
+		stats_trks.loc[8, key] = np.sum(stats_trks[key][1:8])
+
+	for i in range(9):
+		assert stats_dets.loc[i, 'TP'] + stats_dets.loc[i, 'FP'] == stats_dets.loc[i, 'DT']
+		assert stats_dets.loc[i, 'TP'] + stats_dets.loc[i, 'FP_wrong_id'] + stats_dets.loc[i, 'FN'] == stats_dets.loc[i, 'GT']
+		if stats_dets.loc[i, 'DT'] > 0:
+			stats_dets.loc[i, 'Precision'] = stats_dets.loc[i, 'TP'] / stats_dets.loc[i, 'DT']
+		if stats_dets.loc[i, 'GT'] > 0:
+			stats_dets.loc[i, 'Recall'] = stats_dets.loc[i, 'TP'] / stats_dets.loc[i, 'GT']
+
+		assert stats_trks.loc[i, 'TP'] + stats_trks.loc[i, 'FP'] == stats_trks.loc[i, 'DT']
+		assert stats_trks.loc[i, 'TP'] + stats_trks.loc[i, 'FP_wrong_id'] + stats_trks.loc[i, 'FN'] == stats_trks.loc[i, 'GT']
+		if stats_trks.loc[i, 'DT'] > 0:
+			stats_trks.loc[i, 'Precision'] = stats_trks.loc[i, 'TP'] / stats_trks.loc[i, 'DT']
+		if stats_trks.loc[i, 'GT'] > 0:
+			stats_trks.loc[i, 'Recall'] = stats_trks.loc[i, 'TP'] / stats_trks.loc[i, 'GT']
+
+	print("stats_dets:")
+	print(stats_dets)
+	print()
+	print("stats_trks:")
+	print(stats_trks)
 
 	if(display):
 		print("Note: to get real runtime results run without the option: --display")
